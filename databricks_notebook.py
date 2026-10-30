@@ -4,7 +4,7 @@
 # MAGIC Bronze → silver → gold Delta tables in Spark SQL, then segmentation, lapse prediction and forecasting tracked in MLflow.
 # MAGIC
 # MAGIC **Setup (Databricks Free Edition):** add this repo as a Git folder, create a volume
-# MAGIC `workspace.default.retail`, and upload `online_retail_ii.csv` (from `python src/ingest.py`) to it.
+# MAGIC `workspace.default.retail`, and upload `data/online_retail_ii.csv` (created by `python3 analysis.py`) to it.
 
 # COMMAND ----------
 
@@ -24,7 +24,7 @@ spark.sql("USE workspace.default")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Silver: same rules as sql/02_silver.sql (Spark dialect)
+# MAGIC -- Silver: same rules as the silver block in analysis.sql (Spark dialect)
 # MAGIC CREATE OR REPLACE TABLE silver_flagged AS
 # MAGIC SELECT *, CASE
 # MAGIC     WHEN invoice LIKE 'C%' THEN 'cancellation'
@@ -78,8 +78,8 @@ spark.sql("""
 import os, sys
 import mlflow, mlflow.sklearn
 import numpy as np
-sys.path.append(os.path.abspath("../src"))
-from models import FEATURES, forecast, lapse_models, segment, weekly_matrix
+sys.path.append(os.path.abspath("."))
+from analysis import FEATURES, forecast, lapse_models, segment, weekly_matrix
 
 cust = spark.table("gold_customer_features").toPandas()
 train = spark.table("gold_lapse_features").join(spark.table("gold_lapse_labels"), "customer_id").toPandas()

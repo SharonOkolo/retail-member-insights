@@ -1,5 +1,12 @@
-"""Segmentation (k-means), lapse prediction (decision tree vs gradient boosting) and 8-week demand forecasting."""
-import json, os
+"""Retail member insights: layered SQL, customer segmentation, lapse prediction, demand forecast and fairness check.
+
+python3 analysis.py   -> downloads the data (45 MB) on first run, then writes tables and charts to results/
+"""
+import json, os, subprocess, zipfile
+import duckdb
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
@@ -11,9 +18,68 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
-from pipeline import ROOT, build, quality_checks
+ROOT = os.path.dirname(os.path.abspath(__file__))
+OUT = SHOTS = os.path.join(ROOT, "results")
+RAW = os.path.join(ROOT, "data")
 
-OUT = os.path.join(ROOT, "outputs")
+# ---------- SQL layers ----------
+LAPSE_SNAPSHOT = "2011-09-01"   # features before this date, label = no purchase in the following 90 days
+FULL_SNAPSHOT = "2011-12-10"    # day after the last transaction: used for segmentation
+HORIZON = 90
+
+
+SQL_BLOCKS = dict(b.split("\n", 1) for b in open(os.path.join(ROOT, "analysis.sql")).read().split("-- @block ")[1:])
+
+
+def run_sql(con, name, **params):
+    sql = SQL_BLOCKS[name]
+    for k, v in params.items():
+        sql = sql.replace("{" + k + "}", str(v))
+    con.execute(sql)
+
+
+def build(source, db=":memory:"):
+    con = duckdb.connect(db)
+    run_sql(con, "bronze", source=source)
+    run_sql(con, "silver")
+    run_sql(con, "gold_customers", snapshot=LAPSE_SNAPSHOT)
+    run_sql(con, "gold_lapse_labels", snapshot=LAPSE_SNAPSHOT, horizon=HORIZON)
+    con.execute("CREATE OR REPLACE TABLE gold_lapse_features AS SELECT * FROM gold_customer_features")
+    run_sql(con, "gold_customers", snapshot=FULL_SNAPSHOT)
+    run_sql(con, "gold_weekly_sales")
+    return con
+
+
+def quality_checks(con):
+    """Fail loudly if the clean layer breaks its contract."""
+    q = lambda s: con.execute(s).fetchone()[0]
+    assert q("SELECT count(*) FROM silver_sales") > 0, "silver is empty"
+    assert q("SELECT count(*) FROM silver_sales WHERE customer_id IS NULL OR quantity <= 0 OR price <= 0") == 0
+    assert q("SELECT count(*) FROM silver_sales WHERE invoice LIKE 'C%'") == 0
+    assert q("SELECT count(*) - count(DISTINCT customer_id) FROM gold_customer_features") == 0, "duplicate customers"
+    assert q("SELECT min(recency_days) FROM gold_customer_features") >= 0
+    kept = q("SELECT row_count FROM silver_dq_log WHERE reason = 'kept'")
+    dupes = q("SELECT row_count FROM silver_dq_log WHERE reason = 'exact duplicates removed'")
+    assert kept - dupes == q("SELECT count(*) FROM silver_sales"), "row counts don't reconcile"
+    return True
+
+URL = "https://archive.ics.uci.edu/static/public/502/online+retail+ii.zip"
+
+
+# ---------- data ----------
+def download():
+    os.makedirs(RAW, exist_ok=True)
+    out = os.path.join(RAW, "online_retail_ii.csv")
+    if os.path.exists(out):
+        return out
+    z = os.path.join(RAW, "online_retail_ii.zip")
+    if not os.path.exists(z):
+        subprocess.run(["curl", "-sSL", "--retry", "3", "-o", z, URL], check=True)
+    zipfile.ZipFile(z).extractall(RAW)
+    sheets = pd.read_excel(os.path.join(RAW, "online_retail_II.xlsx"), sheet_name=None, dtype={"Invoice": str, "StockCode": str})
+    pd.concat(sheets.values(), ignore_index=True).to_csv(out, index=False)
+    return out
+
 SEED = 42
 FEATURES = ["recency_days", "frequency", "monetary", "tenure_days", "avg_basket", "distinct_products", "is_uk"]
 
@@ -141,7 +207,7 @@ def forecast(wide, horizon=8):
 
 
 def main():
-    con = build(os.path.join(ROOT, "data", "raw", "online_retail_ii.csv"))
+    con = build(download())
     quality_checks(con)
     os.makedirs(OUT, exist_ok=True)
     dq = con.execute("SELECT * FROM silver_dq_log ORDER BY row_count DESC").df()
@@ -204,6 +270,55 @@ def main():
     return metrics
 
 
+# ---------- charts ----------
+INK, MUTED, ACCENT, GREY = "#1f2933", "#616e7c", "#2563eb", "#cbd2d9"
+plt.rcParams.update({"font.size": 11, "axes.spines.top": False, "axes.spines.right": False,
+                     "axes.edgecolor": GREY, "axes.labelcolor": INK, "xtick.color": MUTED, "ytick.color": MUTED})
+
+
+def chart_segments():
+    s = pd.read_csv(os.path.join(OUT, "segments_summary.csv"))
+    s["cust_share"] = s.customers / s.customers.sum()
+    fig, ax = plt.subplots(figsize=(9, 4.2))
+    y = range(len(s))
+    ax.barh([i + 0.2 for i in y], s.cust_share * 100, 0.4, color=GREY, label="Share of customers")
+    ax.barh([i - 0.2 for i in y], s.revenue_share * 100, 0.4, color=ACCENT, label="Share of revenue")
+    ax.set_yticks(list(y), s.segment); ax.invert_yaxis(); ax.set_xlabel("%")
+    for i, r in s.iterrows():
+        ax.text(r.revenue_share * 100 + 1, i - 0.2, f"{r.revenue_share:.0%}", va="center", color=INK)
+    c = s[s.segment == "Champions"].iloc[0]
+    fig.suptitle(f"{c.cust_share:.0%} of customers (Champions) bring in {c.revenue_share:.0%} of revenue", x=0.01, ha="left", color=INK, fontweight="bold")
+    ax.legend(frameon=False, loc="lower right")
+    fig.tight_layout(); fig.savefig(os.path.join(SHOTS, "01_segments.png"), dpi=160); plt.close(fig)
+
+
+def chart_forecast():
+    m = json.load(open(os.path.join(OUT, "metrics.json")))
+    w = m["forecast_wape"]
+    names = sorted(w, key=w.get, reverse=True)
+    fig, ax = plt.subplots(figsize=(9, 3.8))
+    ax.barh(names, [w[n] * 100 for n in names], color=[ACCENT if n == m["forecast_best"] else GREY for n in names])
+    for i, n in enumerate(names):
+        ax.text(w[n] * 100 + 1, i, f"{w[n]:.0%}", va="center", color=INK)
+    ax.set_xlabel("Forecast error (WAPE, %) on the last 8 weeks, top 20 products: lower is better")
+    cut = 1 - w[m["forecast_best"]] / w["naive (last week)"]
+    fig.suptitle(f"Gradient boosting: {cut:.0%} less forecast error than a naive forecast", x=0.01, ha="left", color=INK, fontweight="bold")
+    fig.tight_layout(); fig.savefig(os.path.join(SHOTS, "02_forecast_error.png"), dpi=160); plt.close(fig)
+
+
+def chart_fairness():
+    f = pd.read_csv(os.path.join(OUT, "fairness_lapse_model.csv"))
+    f = f[f.dimension == "spend band"]
+    fig, ax = plt.subplots(figsize=(9, 3.8))
+    ax.bar(f.group, f.recall * 100, color=[ACCENT if g == "top 25%" else GREY for g in f.group])
+    for i, r in enumerate(f.itertuples()):
+        ax.text(i, r.recall * 100 + 2, f"{r.recall:.0%}", ha="center", color=INK)
+    ax.set_ylabel("Lapsing customers caught (%)"); ax.set_xlabel("Customer spend band"); ax.set_ylim(0, 110)
+    fig.suptitle("At one threshold, the model misses most lapsing top spenders", x=0.01, ha="left", color=INK, fontweight="bold")
+    fig.tight_layout(); fig.savefig(os.path.join(SHOTS, "03_fairness_recall.png"), dpi=160); plt.close(fig)
+
 if __name__ == "__main__":
     m = main()
-    print(json.dumps(m, indent=2, default=float))
+    chart_segments(); chart_forecast(); chart_fairness()
+    print(json.dumps({k: m[k] for k in ("rows_bronze", "rows_silver", "customers", "lapse_best", "forecast_best",
+                                        "high_value_at_risk_customers")}, indent=2))
