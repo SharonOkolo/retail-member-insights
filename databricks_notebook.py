@@ -15,7 +15,7 @@
 
 SOURCE = "/Volumes/workspace/default/retail/online_retail_ii.csv"
 spark.sql("USE workspace.default")
-(spark.read.csv(SOURCE, header=True, inferSchema=False)
+(spark.read.csv(SOURCE, header=True, inferSchema=False, quote='"', escape='"')
       .selectExpr("CAST(Invoice AS STRING) invoice", "CAST(StockCode AS STRING) stock_code", "Description description",
                   "CAST(Quantity AS INT) quantity", "CAST(InvoiceDate AS TIMESTAMP) invoice_ts", "CAST(Price AS DOUBLE) price",
                   "CAST(CAST(`Customer ID` AS DOUBLE) AS BIGINT) customer_id", "Country country")
@@ -81,8 +81,8 @@ import numpy as np
 sys.path.append(os.path.abspath("."))
 from analysis import FEATURES, forecast, lapse_models, segment, weekly_matrix
 
-cust = spark.table("gold_customer_features").toPandas()
-train = spark.table("gold_lapse_features").join(spark.table("gold_lapse_labels"), "customer_id").toPandas()
+cust = spark.table("gold_customer_features").toPandas().sort_values("customer_id", ignore_index=True)  # fixed order = reproducible splits
+train = spark.table("gold_lapse_features").join(spark.table("gold_lapse_labels"), "customer_id").toPandas().sort_values("customer_id", ignore_index=True)
 for df in (cust, train):
     df["is_uk"] = (df.country == "United Kingdom").astype(int)
 
